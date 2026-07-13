@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -8,7 +9,8 @@ import streamlit as st
 from src.services.evaluation_service import run_batch_evaluation, save_evaluation_outputs
 from src.services.export_service import build_markdown_report, save_markdown_report
 from src.services.followup_service import apply_followup
-from src.services.llm_service import generate_analysis_plan, parse_user_intent
+from src.services.intent_parser_router import IntentParserError, parse_intent
+from src.services.llm_service import generate_analysis_plan
 from src.services.observability import ExecutionLogger
 from src.services.plan_service import validate_analysis_plan
 from src.services.task_service import execute_analysis_task
@@ -40,6 +42,19 @@ def main() -> None:
         st.header("新建分析")
         uploaded_file = st.file_uploader("上传 CSV 或 XLSX", type=["csv", "xlsx"])
         use_sample = st.button("加载示例费用数据", use_container_width=True)
+        provider_labels = {
+            "rule_based": "规则基线",
+            "openai": "OpenAI 模型",
+            "openai_with_fallback": "OpenAI + 规则回退",
+        }
+        provider = st.selectbox(
+            "解析模式",
+            options=list(provider_labels),
+            format_func=provider_labels.get,
+            index=list(provider_labels).index(os.getenv("LLM_PROVIDER", "rule_based"))
+            if os.getenv("LLM_PROVIDER", "rule_based") in provider_labels
+            else 0,
+        )
 
     parsed = None
     if uploaded_file is not None:
@@ -96,7 +111,7 @@ def main() -> None:
             st.success("未发现明显数据质量问题。")
 
     with task_tab:
-        render_task_creation(df, profile, raw_df)
+        render_task_creation(df, profile, raw_df, provider)
 
     with result_tab:
         render_result_page(df)
@@ -120,6 +135,7 @@ def _initialize_dataset_state(df: pd.DataFrame, dataset_name: str) -> None:
     st.session_state["field_mapping"] = suggest_field_mapping(df)
     st.session_state["cleaning_config"] = CleaningConfig()
     st.session_state["intent"] = None
+    st.session_state["intent_parse_result"] = None
     st.session_state["plan"] = None
     st.session_state["plan_revision"] = 0
     st.session_state["analysis"] = None
@@ -207,7 +223,7 @@ def render_cleaning_editor() -> None:
         st.success("清洗规则已保存。")
 
 
-def render_task_creation(df: pd.DataFrame, profile, raw_df: pd.DataFrame) -> None:
+def render_task_creation(df: pd.DataFrame, profile, raw_df: pd.DataFrame, provider: str) -> None:
     render_mapping_editor(raw_df)
     render_cleaning_editor()
 
@@ -217,12 +233,25 @@ def render_task_creation(df: pd.DataFrame, profile, raw_df: pd.DataFrame) -> Non
         submitted = st.form_submit_button("生成分析计划", type="primary")
 
     if submitted:
-        intent = parse_user_intent(question, profile)
-        plan = generate_analysis_plan(intent)
-        st.session_state["intent"] = intent
-        st.session_state["plan"] = plan
-        st.session_state["plan_revision"] = int(st.session_state.get("plan_revision", 0)) + 1
-        st.session_state["analysis_result"] = None
+        try:
+            parse_result = parse_intent(
+                question,
+                profile,
+                provider=provider,
+                fallback_log_path="docs/bad_cases_log.csv",
+            )
+        except IntentParserError as exc:
+            st.session_state["intent"] = None
+            st.session_state["plan"] = None
+            st.session_state["intent_parse_result"] = None
+            st.error(str(exc))
+        else:
+            intent = parse_result.intent
+            st.session_state["intent_parse_result"] = parse_result
+            st.session_state["intent"] = intent
+            st.session_state["plan"] = generate_analysis_plan(intent)
+            st.session_state["plan_revision"] = int(st.session_state.get("plan_revision", 0)) + 1
+            st.session_state["analysis_result"] = None
 
     intent = st.session_state.get("intent")
     plan = st.session_state.get("plan")
@@ -232,6 +261,23 @@ def render_task_creation(df: pd.DataFrame, profile, raw_df: pd.DataFrame) -> Non
 
     st.subheader("结构化意图")
     st.json(intent.model_dump())
+
+    parse_result = st.session_state.get("intent_parse_result")
+    if parse_result is not None:
+        metadata = parse_result.metadata
+        meta_cols = st.columns(6)
+        meta_cols[0].metric("实际 Provider", metadata.provider)
+        meta_cols[1].metric("模型", metadata.model or "规则引擎")
+        meta_cols[2].metric("耗时", f"{metadata.latency_ms or 0:.1f} ms")
+        meta_cols[3].metric("输入 Token", metadata.input_tokens if metadata.input_tokens is not None else "未返回")
+        meta_cols[4].metric("输出 Token", metadata.output_tokens if metadata.output_tokens is not None else "未返回")
+        meta_cols[5].metric("回退", "是" if metadata.fallback_used else "否")
+        if metadata.total_tokens is not None:
+            st.caption(f"本次调用总 Token：{metadata.total_tokens}")
+        if metadata.fallback_used:
+            st.warning(f"模型未完成解析，已回退到规则基线：{metadata.fallback_reason}")
+        if metadata.validation_errors:
+            st.error("结构化意图未通过本地合法性校验，已阻止执行：" + "；".join(metadata.validation_errors))
 
     if intent.clarification_needed:
         st.warning(intent.clarification_question or "该问题需要进一步确认。")
@@ -249,7 +295,8 @@ def render_task_creation(df: pd.DataFrame, profile, raw_df: pd.DataFrame) -> Non
 
     execute_disabled = intent.clarification_needed or bool(plan_errors)
     if st.button("开始执行 Python 分析", type="primary", disabled=execute_disabled):
-        logger = ExecutionLogger(model="rule_based")
+        metadata = parse_result.metadata if parse_result is not None else None
+        logger = ExecutionLogger(model=(metadata.model if metadata and metadata.model else "rule_based"))
         try:
             analysis, result, validation_report = execute_analysis_task(
                 df,

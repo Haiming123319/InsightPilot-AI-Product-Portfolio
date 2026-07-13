@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from typing import Any
 from typing import Protocol
 
 from src.models.intent import AnalysisIntent
 from src.models.plan import AnalysisPlan, PlanStep
-from src.tools.data_profiler import DataProfile
+from src.tools.data_profiler import DataProfile, profile_to_llm_payload
 
 
 class IntentParser(Protocol):
@@ -24,46 +26,146 @@ class RuleBasedIntentParser:
 
 
 class OpenAIIntentParser:
-    """Optional adapter; it is only instantiated when a real API is configured."""
+    """Optional adapter that only converts a question into a structured intent."""
 
     model_name = "openai"
 
-    def __init__(self, client=None, model: str | None = None) -> None:
+    def __init__(
+        self,
+        client=None,
+        model: str | None = None,
+        timeout_seconds: float | None = None,
+        max_retries: int | None = None,
+        api_key: str | None = None,
+    ) -> None:
         self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self.timeout_seconds = timeout_seconds or float(os.getenv("OPENAI_TIMEOUT_SECONDS", "60"))
+        self.max_retries = max_retries if max_retries is not None else int(os.getenv("OPENAI_MAX_RETRIES", "2"))
+        self.last_call_metadata: dict[str, Any] = {}
         if client is None:
             try:
                 from openai import OpenAI
             except ImportError as exc:
                 raise RuntimeError("使用真实模型前请安装可选依赖：pip install -r requirements-llm.txt") from exc
-            client = OpenAI()
+            client = OpenAI(
+                api_key=api_key or os.getenv("OPENAI_API_KEY"),
+                timeout=self.timeout_seconds,
+                max_retries=self.max_retries,
+            )
         self.client = client
 
     def parse(self, question: str, profile: DataProfile) -> AnalysisIntent:
-        fields = [column.name for column in profile.columns]
-        response = self.client.chat.completions.create(
+        payload = {"question": question, "dataset_profile": profile_to_llm_payload(profile)}
+        started = time.perf_counter()
+        response = self._request(payload)
+        intent = self._parse_response_intent(response)
+        self.last_call_metadata = {
+            "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+            **_usage_metadata(response),
+            "request_id": _request_id(response),
+        }
+        return intent
+
+    def _request(self, payload: dict[str, Any]):
+        system_prompt = (
+            "你是 InsightPilot 的数据分析意图解析器。只能理解用户问题并返回结构化意图，"
+            "不能计算数值、生成 Python、执行工具或给出业务结论。只能引用 dataset_profile 中存在的字段。"
+        )
+        user_content = json.dumps(payload, ensure_ascii=False)
+        responses = getattr(self.client, "responses", None)
+        if responses is not None and hasattr(responses, "parse"):
+            return responses.parse(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+                    {"role": "user", "content": [{"type": "input_text", "text": user_content}]},
+                ],
+                text_format=AnalysisIntent,
+            )
+        if responses is not None and hasattr(responses, "create"):
+            return responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                temperature=0,
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "analysis_intent",
+                        "strict": True,
+                        "schema": AnalysisIntent.model_json_schema(),
+                    }
+                },
+            )
+
+        # Kept as a compatibility path for injected test clients and older SDKs.
+        return self.client.chat.completions.create(
             model=self.model,
             temperature=0,
-            response_format={"type": "json_object"},
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "analysis_intent",
+                    "strict": True,
+                    "schema": AnalysisIntent.model_json_schema(),
+                },
+            },
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "你是数据分析意图解析器。只输出 JSON，字段包括 task_type、objective、metrics、"
-                        "dimensions、filters、time_range、operations、visualizations、"
-                        "clarification_needed、clarification_question、confidence。"
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {"question": question, "available_fields": fields},
-                        ensure_ascii=False,
-                    ),
-                },
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
             ],
         )
-        content = response.choices[0].message.content or "{}"
-        return AnalysisIntent.model_validate(json.loads(content))
+
+    @staticmethod
+    def _parse_response_intent(response) -> AnalysisIntent:
+        parsed = getattr(response, "output_parsed", None)
+        if parsed is not None:
+            return parsed if isinstance(parsed, AnalysisIntent) else AnalysisIntent.model_validate(parsed)
+
+        content = getattr(response, "output_text", None)
+        if not content:
+            choices = getattr(response, "choices", [])
+            if choices:
+                content = getattr(getattr(choices[0], "message", None), "content", None)
+        if not content:
+            raise ValueError("模型未返回可解析的结构化意图。")
+        return AnalysisIntent.model_validate_json(content)
+
+
+def _usage_metadata(response) -> dict[str, int | None]:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return {"input_tokens": None, "output_tokens": None, "total_tokens": None}
+    input_tokens = _usage_value(usage, "input_tokens", "prompt_tokens")
+    output_tokens = _usage_value(usage, "output_tokens", "completion_tokens")
+    total_tokens = _usage_value(usage, "total_tokens")
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _usage_value(usage, *names: str) -> int | None:
+    for name in names:
+        value = getattr(usage, name, None)
+        if value is None and isinstance(usage, dict):
+            value = usage.get(name)
+        if value is not None:
+            return int(value)
+    return None
+
+
+def _request_id(response) -> str | None:
+    for name in ("_request_id", "request_id", "id"):
+        value = getattr(response, name, None)
+        if value:
+            return str(value)
+    return None
 
 
 def parse_user_intent(question: str, profile: DataProfile) -> AnalysisIntent:

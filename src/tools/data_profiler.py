@@ -20,6 +20,7 @@ class ColumnProfile:
     unique_count: int
     sample_values: list[str]
     issues: list[str]
+    semantic_type: str = ""
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,7 @@ class DataProfile:
     duplicate_count: int
     columns: list[ColumnProfile]
     issues: list[str]
+    date_range: list[str] | None = None
 
 
 def profile_dataframe(df: pd.DataFrame) -> DataProfile:
@@ -52,6 +54,7 @@ def profile_dataframe(df: pd.DataFrame) -> DataProfile:
         duplicate_count=duplicate_count,
         columns=columns,
         issues=issues,
+        date_range=_infer_date_range(df),
     )
 
 
@@ -103,7 +106,80 @@ def _profile_column(series: pd.Series, name: str) -> ColumnProfile:
         unique_count=int(non_null.nunique()),
         sample_values=sample_values,
         issues=issues,
+        semantic_type=_semantic_type(inferred_type),
     )
+
+
+def profile_to_llm_payload(profile: DataProfile, *, max_samples: int = 3) -> dict[str, Any]:
+    """Build a bounded, de-identified dataset summary for intent parsing."""
+
+    return {
+        "row_count": profile.row_count,
+        "date_range": profile.date_range or [],
+        "columns": [
+            {
+                "name": column.name,
+                "dtype": column.dtype,
+                "semantic_type": column.semantic_type or column.inferred_type,
+                "missing_rate": round(column.missing_rate, 4),
+                "unique_count": column.unique_count,
+                "sample_values": _safe_sample_values(
+                    column.sample_values[:max_samples],
+                    semantic_type=column.semantic_type or column.inferred_type,
+                ),
+            }
+            for column in profile.columns
+        ],
+        "supported_task_types": ["department_summary", "department_yoy", "anomaly_detection"],
+        "supported_operations": [
+            "clean",
+            "groupby",
+            "sum",
+            "year_over_year",
+            "rank",
+            "contribution",
+            "iqr_anomaly_detection",
+        ],
+    }
+
+
+def _safe_sample_values(values: list[str], *, semantic_type: str) -> list[str]:
+    safe: list[str] = []
+    for value in values:
+        text = str(value).strip()
+        if not text:
+            continue
+        if semantic_type in {"text", "文本"}:
+            safe.append("[redacted]")
+            continue
+        if len(text) > 40:
+            text = text[:37] + "..."
+        if any(token in text.lower() for token in ["@", "身份证", "手机号", "phone", "email"]):
+            safe.append("[redacted]")
+        else:
+            safe.append(text)
+    return safe
+
+
+def _semantic_type(inferred_type: str) -> str:
+    return {
+        "金额": "currency",
+        "日期": "date",
+        "数值": "number",
+        "分类": "category",
+        "文本": "text",
+        "空字段": "unknown",
+    }.get(inferred_type, "unknown")
+
+
+def _infer_date_range(df: pd.DataFrame) -> list[str]:
+    date_columns = [column for column in df.columns if _infer_type(df[column], str(column)) == "日期"]
+    if not date_columns:
+        return []
+    parsed = pd.to_datetime(df[date_columns[0]], errors="coerce", format="mixed").dropna()
+    if parsed.empty:
+        return []
+    return [parsed.min().date().isoformat(), parsed.max().date().isoformat()]
 
 
 def _infer_type(series: pd.Series, name: str) -> str:

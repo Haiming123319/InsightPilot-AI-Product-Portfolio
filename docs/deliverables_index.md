@@ -29,6 +29,10 @@ streamlit run app.py
 | `docs/bad_cases_log.csv` | 当前 Bad Case 日志 |
 | `docs/verification_report.md` | 集中验证报告 |
 | `docs/v6_verification_report.md` | V6 工作流验证报告 |
+| `docs/pre_api_baseline.md` | Phase 0 API 接入前测试基线 |
+| `docs/current_code_audit.md` | Phase 0 真实代码调用链审计 |
+| `docs/phase1_real_intent_parser_report.md` | Phase 1 真实模型意图解析验收报告 |
+| `docs/phase0_phase1_product_decision_log.md` | 每项技术改动的用户问题、价值、风险、评测与作品集表达 |
 
 ## 3. 作品集文档
 
@@ -71,7 +75,7 @@ streamlit run app.py
 
 - Demo 录屏
 - PDF 视觉版作品集
-- 真实 OpenAI API 调用与线上错误兜底
+- 真实 OpenAI API 的线上效果、成本与 P95 延迟数据
 - 更完整的多轮追问
 - 三方案对比实验
 - Token、API 成本和模型响应时间统计
@@ -80,6 +84,6 @@ streamlit run app.py
 - 多 Agent、RAG、模型微调和自动生成 PPT
 - GitHub 远程仓库链接
 
-已完成但仍为可选能力的 V6 适配器：`requirements-llm.txt` 只用于安装真实模型 SDK，默认 Demo 不调用外部 API。
+Phase 1 已接入真实 OpenAI 适配器，但默认 Demo 仍使用规则基线；`requirements-llm.txt` 用于安装真实模型 SDK。自动化测试通过 Mock，不代表真实 API 效果已经评测。
 
 这些能力已经有明确的版本规划，但不应被表述为当前已实现功能。请查看 `docs/next_phase_roadmap.md`。
