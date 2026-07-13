@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import pandas as pd
 
+from src.models.config import CleaningConfig
 from src.models.intent import AnalysisIntent
+from src.models.plan import AnalysisPlan
 from src.models.result import AnalysisClaim, AnalysisResult, Evidence
 from src.models.validation import ValidationCheck
 from src.models.validation import ValidationReport
+from src.services.observability import ExecutionLogger
+from src.services.plan_service import validate_analysis_plan
 from src.tools.analysis_tools import (
     AnomalyAnalysis,
     DepartmentSummaryAnalysis,
@@ -43,36 +47,87 @@ anomalies = valid[valid["amount_clean"] > threshold]
 """
 
 
-def execute_analysis_task(df, intent: AnalysisIntent):
-    if intent.task_type == "department_summary":
-        return execute_department_summary_task(df)
-    if intent.task_type == "anomaly_detection":
-        return execute_anomaly_task(df)
-    return execute_department_yoy_task(df)
+def execute_analysis_task(
+    df,
+    intent: AnalysisIntent,
+    plan: AnalysisPlan | None = None,
+    cleaning_config: CleaningConfig | None = None,
+    event_logger: ExecutionLogger | None = None,
+):
+    logger = event_logger or ExecutionLogger()
+    config = cleaning_config or CleaningConfig()
+    logger.log("task_started", details={"task_type": intent.task_type, "row_count": int(len(df))})
+    logger.log("intent_parsed", details={"confidence": intent.confidence, "task_type": intent.task_type})
+
+    try:
+        if plan is not None:
+            plan_errors = validate_analysis_plan(plan, intent)
+            if plan_errors:
+                raise AnalysisExecutionError("分析计划无法执行：" + "；".join(plan_errors))
+            logger.log(
+                "plan_generated",
+                details={"step_count": len(plan.steps), "enabled_steps": sum(step.enabled for step in plan.steps)},
+            )
+        else:
+            logger.log("plan_generated", details={"step_count": 0, "source": "default_execution"})
+
+        logger.log(
+            "tool_started",
+            component="python_executor",
+            details={
+                "task_type": intent.task_type,
+                "cleaning_config": config.model_dump(),
+            },
+        )
+        if intent.task_type == "department_summary":
+            output = execute_department_summary_task(df, cleaning_config=config)
+        elif intent.task_type == "anomaly_detection":
+            output = execute_anomaly_task(df, cleaning_config=config)
+        else:
+            output = execute_department_yoy_task(df, cleaning_config=config)
+        logger.log("tool_finished", component="python_executor", details={"task_type": intent.task_type})
+        logger.log("validation_finished", component="validation", details={"passed": output[2].passed})
+        logger.log("task_finished", details={"validation_passed": output[2].passed})
+        return output
+    except Exception as exc:
+        logger.log("task_failed", status="failed", details={"error_type": type(exc).__name__, "message": str(exc)})
+        raise
 
 
-def execute_department_yoy_task(df) -> tuple[DepartmentYoyAnalysis, AnalysisResult, ValidationReport]:
-    analysis = run_department_yoy_analysis(df)
-    result = build_result(analysis)
+def execute_department_yoy_task(
+    df,
+    cleaning_config: CleaningConfig | None = None,
+) -> tuple[DepartmentYoyAnalysis, AnalysisResult, ValidationReport]:
+    config = cleaning_config or CleaningConfig()
+    analysis = run_department_yoy_analysis(df, cleaning_config=config)
+    result = build_result(analysis, config)
     validation_report = validate_analysis_result(df, analysis, result)
     return analysis, result, validation_report
 
 
-def execute_department_summary_task(df) -> tuple[DepartmentSummaryAnalysis, AnalysisResult, ValidationReport]:
-    analysis = run_department_summary_analysis(df)
-    result = build_summary_result(analysis)
+def execute_department_summary_task(
+    df,
+    cleaning_config: CleaningConfig | None = None,
+) -> tuple[DepartmentSummaryAnalysis, AnalysisResult, ValidationReport]:
+    config = cleaning_config or CleaningConfig()
+    analysis = run_department_summary_analysis(df, cleaning_config=config)
+    result = build_summary_result(analysis, config)
     validation_report = _validate_summary_result(analysis, result)
     return analysis, result, validation_report
 
 
-def execute_anomaly_task(df) -> tuple[AnomalyAnalysis, AnalysisResult, ValidationReport]:
-    analysis = run_anomaly_analysis(df)
-    result = build_anomaly_result(analysis)
+def execute_anomaly_task(
+    df,
+    cleaning_config: CleaningConfig | None = None,
+) -> tuple[AnomalyAnalysis, AnalysisResult, ValidationReport]:
+    config = cleaning_config or CleaningConfig()
+    analysis = run_anomaly_analysis(df, cleaning_config=config)
+    result = build_anomaly_result(analysis, config)
     validation_report = _validate_anomaly_result(analysis, result)
     return analysis, result, validation_report
 
 
-def build_result(analysis: DepartmentYoyAnalysis) -> AnalysisResult:
+def build_result(analysis: DepartmentYoyAnalysis, cleaning_config: CleaningConfig | None = None) -> AnalysisResult:
     top_row = analysis.department_yoy.iloc[0]
     top_department = str(top_row["department"])
     top_growth = top_row["yoy_growth"]
@@ -126,6 +181,7 @@ def build_result(analysis: DepartmentYoyAnalysis) -> AnalysisResult:
     if analysis.excluded_rows:
         limitations.append(f"有 {analysis.excluded_rows} 行因日期、金额或关键维度缺失未纳入 2024/2025 同比计算。")
     limitations.append("本分析是描述性分析，只能说明增长集中在哪些费用类型，不能证明因果关系。")
+    limitations.extend(_cleaning_limitations(cleaning_config))
 
     evidence = [
         Evidence(
@@ -147,7 +203,7 @@ def build_result(analysis: DepartmentYoyAnalysis) -> AnalysisResult:
     return AnalysisResult(summary=summary, claims=claims, limitations=limitations, evidence=evidence)
 
 
-def build_summary_result(analysis: DepartmentSummaryAnalysis) -> AnalysisResult:
+def build_summary_result(analysis: DepartmentSummaryAnalysis, cleaning_config: CleaningConfig | None = None) -> AnalysisResult:
     top_row = analysis.department_totals.iloc[0]
     summary = (
         f"本次可计算费用总额为 {analysis.total_amount:,.0f}。"
@@ -174,6 +230,7 @@ def build_summary_result(analysis: DepartmentSummaryAnalysis) -> AnalysisResult:
     limitations = []
     if analysis.excluded_rows:
         limitations.append(f"有 {analysis.excluded_rows} 行因部门或金额缺失未纳入汇总。")
+    limitations.extend(_cleaning_limitations(cleaning_config))
     evidence = [
         Evidence(
             evidence_id="table_department_totals",
@@ -186,7 +243,7 @@ def build_summary_result(analysis: DepartmentSummaryAnalysis) -> AnalysisResult:
     return AnalysisResult(summary=summary, claims=claims, limitations=limitations, evidence=evidence)
 
 
-def build_anomaly_result(analysis: AnomalyAnalysis) -> AnalysisResult:
+def build_anomaly_result(analysis: AnomalyAnalysis, cleaning_config: CleaningConfig | None = None) -> AnalysisResult:
     if analysis.anomaly_table.empty:
         summary = f"基于 IQR 方法未发现超过 {analysis.threshold:,.0f} 的异常大额费用。"
         claims = [
@@ -224,6 +281,7 @@ def build_anomaly_result(analysis: AnomalyAnalysis) -> AnalysisResult:
             ),
         ]
     limitations = ["异常判断采用 IQR 统计阈值，只代表金额分布异常，不等于业务违规。"]
+    limitations.extend(_cleaning_limitations(cleaning_config))
     evidence = [
         Evidence(
             evidence_id="table_amount_anomalies",
@@ -258,6 +316,18 @@ def _validate_summary_result(analysis: DepartmentSummaryAnalysis, result: Analys
         ),
     ]
     return ValidationReport(passed=all(check.passed for check in checks), checks=checks)
+
+
+def _cleaning_limitations(cleaning_config: CleaningConfig | None) -> list[str]:
+    config = cleaning_config or CleaningConfig()
+    limitations: list[str] = []
+    if config.anomaly_action == "exclude":
+        limitations.append("本次重算已按 IQR 阈值排除异常大额费用记录。")
+    if config.missing_amount == "zero":
+        limitations.append("缺失或无法转换的金额已按 0 纳入计算。")
+    if config.duplicate_rows == "keep_all":
+        limitations.append("本次计算保留了重复记录，请结合业务主键复核。")
+    return limitations
 
 
 def _validate_anomaly_result(analysis: AnomalyAnalysis, result: AnalysisResult) -> ValidationReport:

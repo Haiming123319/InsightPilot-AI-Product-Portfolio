@@ -1,8 +1,69 @@
 from __future__ import annotations
 
+import json
+import os
+from typing import Protocol
+
 from src.models.intent import AnalysisIntent
 from src.models.plan import AnalysisPlan, PlanStep
 from src.tools.data_profiler import DataProfile
+
+
+class IntentParser(Protocol):
+    def parse(self, question: str, profile: DataProfile) -> AnalysisIntent:
+        ...
+
+
+class RuleBasedIntentParser:
+    """Stable local baseline used by the Demo and batch evaluation."""
+
+    model_name = "rule_based"
+
+    def parse(self, question: str, profile: DataProfile) -> AnalysisIntent:
+        return parse_user_intent(question, profile)
+
+
+class OpenAIIntentParser:
+    """Optional adapter; it is only instantiated when a real API is configured."""
+
+    model_name = "openai"
+
+    def __init__(self, client=None, model: str | None = None) -> None:
+        self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        if client is None:
+            try:
+                from openai import OpenAI
+            except ImportError as exc:
+                raise RuntimeError("使用真实模型前请安装可选依赖：pip install -r requirements-llm.txt") from exc
+            client = OpenAI()
+        self.client = client
+
+    def parse(self, question: str, profile: DataProfile) -> AnalysisIntent:
+        fields = [column.name for column in profile.columns]
+        response = self.client.chat.completions.create(
+            model=self.model,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是数据分析意图解析器。只输出 JSON，字段包括 task_type、objective、metrics、"
+                        "dimensions、filters、time_range、operations、visualizations、"
+                        "clarification_needed、clarification_question、confidence。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {"question": question, "available_fields": fields},
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+        )
+        content = response.choices[0].message.content or "{}"
+        return AnalysisIntent.model_validate(json.loads(content))
 
 
 def parse_user_intent(question: str, profile: DataProfile) -> AnalysisIntent:

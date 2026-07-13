@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from src.models.config import CleaningConfig
 from src.tools.data_cleaner import clean_expense_dataframe
 
 
@@ -48,13 +49,16 @@ class AnomalyAnalysis:
     anomaly_count: int
 
 
-def run_department_yoy_analysis(df: pd.DataFrame) -> DepartmentYoyAnalysis:
+def run_department_yoy_analysis(
+    df: pd.DataFrame,
+    cleaning_config: CleaningConfig | None = None,
+) -> DepartmentYoyAnalysis:
     required = {"date", "department", "expense_type", "amount"}
     missing = sorted(required - set(df.columns))
     if missing:
         raise AnalysisExecutionError(f"缺少必要字段：{', '.join(missing)}")
 
-    cleaned = clean_expense_dataframe(df)
+    cleaned = clean_expense_dataframe(df, cleaning_config)
     valid = cleaned.dropna(subset=["date_clean", "amount_clean", "department", "expense_type"]).copy()
     valid = valid[valid["year"].isin([2024, 2025])]
     if valid.empty:
@@ -124,13 +128,16 @@ def run_department_yoy_analysis(df: pd.DataFrame) -> DepartmentYoyAnalysis:
     )
 
 
-def run_department_summary_analysis(df: pd.DataFrame) -> DepartmentSummaryAnalysis:
+def run_department_summary_analysis(
+    df: pd.DataFrame,
+    cleaning_config: CleaningConfig | None = None,
+) -> DepartmentSummaryAnalysis:
     required = {"department", "amount"}
     missing = sorted(required - set(df.columns))
     if missing:
         raise AnalysisExecutionError(f"缺少必要字段：{', '.join(missing)}")
 
-    cleaned = clean_expense_dataframe(df)
+    cleaned = clean_expense_dataframe(df, cleaning_config)
     valid = cleaned.dropna(subset=["department", "amount_clean"]).copy()
     if valid.empty:
         raise AnalysisExecutionError("没有可用于部门费用汇总的有效数据。")
@@ -156,13 +163,18 @@ def run_department_summary_analysis(df: pd.DataFrame) -> DepartmentSummaryAnalys
     )
 
 
-def run_anomaly_analysis(df: pd.DataFrame) -> AnomalyAnalysis:
+def run_anomaly_analysis(
+    df: pd.DataFrame,
+    cleaning_config: CleaningConfig | None = None,
+) -> AnomalyAnalysis:
     required = {"date", "department", "expense_type", "amount"}
     missing = sorted(required - set(df.columns))
     if missing:
         raise AnalysisExecutionError(f"缺少必要字段：{', '.join(missing)}")
 
-    cleaned = clean_expense_dataframe(df)
+    # 异常分析必须先保留异常记录，否则无法识别它们。
+    anomaly_config = (cleaning_config or CleaningConfig()).model_copy(update={"anomaly_action": "include"})
+    cleaned = clean_expense_dataframe(df, anomaly_config)
     valid = cleaned.dropna(subset=["amount_clean"]).copy()
     if valid.empty:
         raise AnalysisExecutionError("没有可用于异常分析的有效金额数据。")

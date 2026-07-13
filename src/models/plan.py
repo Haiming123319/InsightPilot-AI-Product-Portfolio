@@ -10,10 +10,11 @@ class PlanStep(BaseModel):
     description: str
     inputs: list[str] = Field(default_factory=list)
     expected_output: str
+    enabled: bool = True
+    parameters: dict[str, str | int | float | bool] = Field(default_factory=dict)
 
 
 class AnalysisPlan(BaseModel):
     objective: str
     steps: list[PlanStep]
     warnings: list[str] = Field(default_factory=list)
-

@@ -36,6 +36,18 @@ InsightPilot 是一个面向 AI 产品经理作品集的可验证数据分析 Co
 
 说明：当前仍不调用真实大模型 API，`src/services/llm_service.py` 先用规则模拟 LLM 结构化输出，保证 Demo 闭环可稳定运行。后续可替换为 OpenAI API 或兼容模型 API。
 
+## 作品集阅读顺序
+
+建议按以下顺序查看：
+
+1. `docs/deliverables_index.md`：所有交付物索引
+2. `docs/iteration_history.md`：按版本记录每轮为什么做、做了什么、验证结果
+3. `docs/verification_report.md`：集中验证报告
+4. `docs/portfolio_outline.md`：17 页作品集成稿
+5. `docs/PRD.md`：精简 PRD
+6. `docs/project_review.md`：项目复盘
+7. `docs/next_phase_roadmap.md`：下一阶段产品路线和能力边界
+
 ## 安装
 
 ```bash
@@ -90,4 +102,4 @@ pytest
 
 ## 下一阶段建议
 
-下一阶段建议接入真实 OpenAI API、实现可编辑字段映射和计划步骤、支持“排除异常值后重新分析”的追问、加入三方案对比实验，并录制 2-4 分钟 Demo。
+下一阶段优先做 V6：可编辑字段映射、可编辑清洗规则、可编辑分析计划、至少一个多轮追问、执行事件日志和真实模型适配器。多文件关联与三方案评测放入 V7；数据库、权限、协作、RAG、微调和自动生成 PPT 放入后续扩展。具体路线、验收标准和暂缓原因见 `docs/next_phase_roadmap.md`。

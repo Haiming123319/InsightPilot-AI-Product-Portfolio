@@ -1,0 +1,2 @@
+# Optional dependency for the V6 real-model adapter.
+openai>=1.50.0
